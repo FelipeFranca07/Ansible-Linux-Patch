@@ -187,11 +187,12 @@ steps:
 
 ## 4. Script de patch
 
-`patch.sh` é o script que efetivamente roda dentro do servidor. Ele é desenhado para **nunca abortar no meio** (sem `exit`/`return`), garantindo que o relatório final sempre seja enviado, mesmo que uma etapa falhe.
+`patch.sh` é o script que efetivamente roda dentro do servidor. O nome "noexit" no script original não é por acaso: ele é desenhado para **nunca abortar no meio** — nenhum `exit`/`return`, cada comando arriscado termina em `|| true` — garantindo que o relatório final sempre seja montado e enviado, mesmo que uma etapa específica falhe.
 
 ```bash
 #!/bin/bash
 # patch.sh — aplica upgrades de segurança e notifica o resultado
+# Não usa 'exit' nem 'return' — termina naturalmente, sempre enviando o relatório.
 set -uo pipefail
 IFS=$'\n\t'
 
@@ -203,54 +204,120 @@ WEBHOOK_URL="${PATCH_WEBHOOK_URL:-https://chat.example.com/webhook/EXEMPLO}"
 # (mude para os pacotes sensíveis do seu ambiente: web server, banco, runtime de app, etc.)
 BLACKLIST_REGEX='^(php|nginx|apache2|mysql|mariadb|postgresql|redis-server)'
 
+# Modo não-interativo: evita prompts de configuração de pacote e do 'needrestart'
+# (que pergunta quais serviços reiniciar após um upgrade de lib compartilhada)
 export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+export NEEDRESTART_SUSPEND=1
 
+# --- COLETA DE DADOS DO SISTEMA ---
 HOST="$(hostname -f 2>/dev/null || hostname)"
+IP="$(hostname -I 2>/dev/null | awk '{print $1}' || echo 'N/A')"
+ARQUITETURA="$(uname -m)"
+SO="$(grep -E '^PRETTY_NAME=' /etc/os-release | cut -d '"' -f 2 || echo 'Linux Desconhecido')"
 KERNEL_ANTES="$(uname -r)"
 DATA_HORA="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+START=$(date +%s)
 
 if [ "$(id -u)" -ne 0 ]; then
-    echo "Execute como root." >&2
+    echo "Execute como root (sudo)." >&2
 else
     apt update >/dev/null 2>&1 || true
 
-    mapfile -t PENDENTES < <(apt list --upgradable 2>/dev/null | awk -F/ 'NR>1 {print $1}')
+    mapfile -t UPGRADABLE_ALL < <(apt list --upgradable 2>/dev/null | awk -F/ 'NR>1 {print $1}')
+    PENDENTES_COUNT=${#UPGRADABLE_ALL[@]}
 
-    # separa pacotes de kernel dos demais
-    mapfile -t KERNEL_PKGS < <(printf '%s\n' "${PENDENTES[@]}" | grep -E '^linux-(image|headers|generic)' || true)
-    mapfile -t COMMON_CANDIDATES < <(printf '%s\n' "${PENDENTES[@]}" | grep -v -E '^linux-(image|headers|generic)' || true)
+    if [ "$PENDENTES_COUNT" -eq 0 ]; then
+        STATUS="NENHUMA ATUALIZAÇÃO"
+        SUCESSO="NÃO"
+        KERNEL_DEPOIS="$KERNEL_ANTES"
+        KERNEL_ALTERADO="NÃO"
+        TOTAL_APLICADAS=0
+        TOTAL_FALHAS=0
+    else
+        STATUS="ATUALIZADO"
 
-    # remove os pacotes da blacklist
-    ALLOWED_COMMON=()
-    for pkg in "${COMMON_CANDIDATES[@]}"; do
-        printf '%s\n' "$pkg" | grep -Eq "$BLACKLIST_REGEX" || ALLOWED_COMMON+=("$pkg")
-    done
+        # separa pacotes de kernel dos demais
+        mapfile -t KERNEL_BEFORE < <(printf '%s\n' "${UPGRADABLE_ALL[@]}" | grep -E '^linux-(image|headers|generic)' || true)
+        mapfile -t COMMON_CANDIDATES < <(printf '%s\n' "${UPGRADABLE_ALL[@]}" | grep -v -E '^linux-(image|headers|generic)' || true)
 
-    # aplica os upgrades permitidos
-    [ "${#ALLOWED_COMMON[@]}" -gt 0 ] && apt install --only-upgrade -y "${ALLOWED_COMMON[@]}" >/dev/null 2>&1 || true
-    [ "${#KERNEL_PKGS[@]}" -gt 0 ]    && apt install --only-upgrade -y "${KERNEL_PKGS[@]}"    >/dev/null 2>&1 || true
+        # remove os pacotes da blacklist
+        ALLOWED_COMMON=()
+        for pkg in "${COMMON_CANDIDATES[@]}"; do
+            printf '%s\n' "$pkg" | grep -Eq "$BLACKLIST_REGEX" || ALLOWED_COMMON+=("$pkg")
+        done
 
-    KERNEL_DEPOIS="$(ls -1t /boot/vmlinuz-* 2>/dev/null | head -n1 | sed 's|/boot/vmlinuz-||' || echo "$KERNEL_ANTES")"
+        # ---- aplica pacotes comuns e verifica, um a um, quais realmente saíram da lista de pendentes ----
+        COMMON_APPLIED=(); COMMON_FAILED=()
+        if [ "${#ALLOWED_COMMON[@]}" -gt 0 ]; then
+            apt install --only-upgrade -y "${ALLOWED_COMMON[@]}" >/tmp/patch_common.apt.log 2>&1 || true
+            mapfile -t COMMON_AFTER < <(apt list --upgradable 2>/dev/null | awk -F/ 'NR>1 {print $1}')
+            for pkg in "${ALLOWED_COMMON[@]}"; do
+                printf '%s\n' "${COMMON_AFTER[@]}" | grep -qx "$pkg" && COMMON_FAILED+=("$pkg") || COMMON_APPLIED+=("$pkg")
+            done
+        fi
 
-    MSG="Servidor: $HOST | Data: $DATA_HORA | Pendentes: ${#PENDENTES[@]} | Comuns aplicados: ${#ALLOWED_COMMON[@]} | Kernel: $KERNEL_ANTES -> $KERNEL_DEPOIS"
+        # ---- mesma lógica de antes/depois para o kernel ----
+        KERNEL_APPLIED=(); KERNEL_FAILED=()
+        if [ "${#KERNEL_BEFORE[@]}" -gt 0 ]; then
+            apt install --only-upgrade -y "${KERNEL_BEFORE[@]}" >/tmp/patch_kernel.apt.log 2>&1 || true
+            mapfile -t KERNEL_AFTER < <(apt list --upgradable 2>/dev/null | awk -F/ 'NR>1 {print $1}' | grep -E '^linux-(image|headers|generic)' || true)
+            for pkg in "${KERNEL_BEFORE[@]}"; do
+                printf '%s\n' "${KERNEL_AFTER[@]}" | grep -qx "$pkg" && KERNEL_FAILED+=("$pkg") || KERNEL_APPLIED+=("$pkg")
+            done
+        fi
 
-    curl -sS -X POST -H "Content-Type: application/json" \
-      -d "{\"text\": \"$MSG\"}" "$WEBHOOK_URL" >/dev/null 2>&1 || true
+        TOTAL_APLICADAS=$(( ${#COMMON_APPLIED[@]} + ${#KERNEL_APPLIED[@]} ))
+        TOTAL_FALHAS=$(( ${#COMMON_FAILED[@]} + ${#KERNEL_FAILED[@]} ))
+        [ "$TOTAL_APLICADAS" -gt 0 ] && SUCESSO="SIM" || SUCESSO="NÃO"
+
+        # kernel só "mudou de verdade" se o pacote aplicou E a versão em /boot é diferente da que estava rodando
+        KERNEL_DEPOIS="$(ls -1t /boot/vmlinuz-* 2>/dev/null | head -n1 | sed 's|/boot/vmlinuz-||' || echo "$KERNEL_ANTES")"
+        if [ "${#KERNEL_APPLIED[@]}" -gt 0 ] && [ "$KERNEL_ANTES" != "$KERNEL_DEPOIS" ]; then
+            KERNEL_ALTERADO="SIM"
+        else
+            KERNEL_ALTERADO="NÃO"
+            KERNEL_DEPOIS="$KERNEL_ANTES"
+        fi
+    fi
+
+    END=$(date +%s)
+    ELAPSED=$((END - START))
+
+    MSG="Servidor: $HOST ($IP) | SO: $SO ($ARQUITETURA) | Data: $DATA_HORA
+Status: $STATUS | Pendentes: $PENDENTES_COUNT | Aplicados: $TOTAL_APLICADAS | Falhas: $TOTAL_FALHAS
+Kernel: $KERNEL_ANTES -> $KERNEL_DEPOIS (Alterado: $KERNEL_ALTERADO) | Tempo: ${ELAPSED}s"
+
+    # escapa a mensagem como string JSON válida antes de enviar (evita quebrar o payload
+    # se algum nome de pacote ou linha tiver aspas/caracteres especiais)
+    if command -v python3 >/dev/null 2>&1; then
+        ESCAPED=$(printf '%s' "$MSG" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
+        curl -sS -X POST -H "Content-Type: application/json" -d "{\"text\": $ESCAPED}" "$WEBHOOK_URL" >/dev/null 2>&1 || true
+    else
+        # fallback simples caso o servidor não tenha python3 instalado
+        curl -sS -X POST -H "Content-Type: application/json" -d "{\"text\":\"${MSG//\"/\\\"}\"}" "$WEBHOOK_URL" >/dev/null 2>&1 || true
+    fi
 
     printf '%s\n' "$MSG"
 fi
 ```
 
-**Lógica principal:**
+**Lógica principal, passo a passo:**
 
-1. Roda `apt update` e lista tudo que está pendente de upgrade.
-2. Separa em **kernel** (`linux-image`, `linux-headers`, ...) e **demais pacotes**.
-3. Remove da lista de "demais pacotes" tudo que bate com a **blacklist** — pacotes sensíveis a versão (web server, banco de dados, runtime de linguagem) que você prefere atualizar manualmente, com uma janela de validação.
-4. Aplica `apt install --only-upgrade` nos dois grupos restantes.
-5. Compara o kernel em execução antes/depois e monta uma mensagem de resumo.
-6. Envia a mensagem para o webhook de chat e imprime no stdout (capturado pelo Ansible/pipeline).
+1. **Modo não-interativo** — além do clássico `DEBIAN_FRONTEND=noninteractive`, o script também neutraliza o `needrestart` (`NEEDRESTART_MODE=a`, `NEEDRESTART_SUSPEND=1`), que em servidores modernos com Debian/Ubuntu abre um prompt interativo perguntando quais serviços reiniciar após atualizar uma lib compartilhada (`libssl`, `libc6`, etc.) — sem isso, o `apt` trava esperando input em uma execução não-interativa.
+2. **Coleta de contexto do servidor** — hostname, IP, arquitetura (`uname -m`), nome bonito do SO (`PRETTY_NAME` do `/etc/os-release`) e o kernel em execução, tudo isso vai para o relatório final.
+3. `apt update` e lista de pendentes (`apt list --upgradable`).
+4. Separa em **kernel** (`linux-image`, `linux-headers`, ...) e **demais pacotes**, removendo da segunda lista tudo que bate com a **blacklist**.
+5. Aplica `apt install --only-upgrade`, redirecionando a saída para um log em `/tmp` (`patch_common.apt.log` / `patch_kernel.apt.log`) — útil para investigar uma falha específica direto no servidor, já que o relatório do chat não inclui o log completo.
+6. **Verificação pacote a pacote**: em vez de confiar no código de saída do `apt` (que pode retornar sucesso mesmo com um pacote individual falho), o script compara a lista de pendentes *antes* e *depois* — um pacote que some da lista foi aplicado; um que continua lá é contado como falha. Isso alimenta os contadores `TOTAL_APLICADAS`/`TOTAL_FALHAS`.
+7. **Kernel "alterado" tem duas condições**, não uma: o pacote de kernel precisa ter sido aplicado com sucesso **e** a versão mais recente em `/boot` precisa ser diferente da que estava rodando (`uname -r` antes). Isso evita reportar "kernel alterado" quando, por exemplo, o pacote já estava na versão mais recente disponível em disco.
+8. Monta a mensagem final com todos os campos e mede o tempo total de execução (`START`/`END`).
+9. **Escapa a mensagem como JSON de verdade** (via `python3 -c 'json.dumps(...)'`) antes de montar o payload do webhook — evita quebrar a requisição se um nome de pacote ou uma variável tiver aspas ou caractere especial; há um fallback manual de escaping caso o servidor não tenha `python3`.
+10. Envia por `curl -X POST` e também imprime a mensagem no stdout, capturado pelo Ansible/pipeline — assim o resultado fica visível tanto no chat quanto no log da execução.
 
-> ⚠️ **Kernel atualizado ≠ kernel em uso.** Instalar um novo pacote de kernel não faz o servidor rodar nele — isso só acontece após um **reboot**. Se seu processo não reinicia os servidores automaticamente, decida separadamente como/quando fazer isso (janela de manutenção, reboot escalonado, etc.).
+> ⚠️ **Kernel atualizado ≠ kernel em uso.** Mesmo com a checagem dupla acima, instalar um novo pacote de kernel não faz o servidor rodar nele — isso só acontece após um **reboot**. Se seu processo não reinicia os servidores automaticamente, decida separadamente como/quando fazer isso (janela de manutenção, reboot escalonado, etc.).
+
+> 💡 **Por que comparar antes/depois em vez de checar o código de saída do apt?** Um `apt install --only-upgrade pacote1 pacote2 pacote3` pode retornar código de saída 0 (sucesso) mesmo que um dos três pacotes tenha falhado por um motivo pontual (repositório temporariamente indisponível, conflito de dependência). Comparar a lista de upgradable antes/depois pega isso por pacote individual, não só o resultado agregado do comando.
 
 ---
 
