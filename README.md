@@ -13,6 +13,7 @@ Automação de **patch mensal de segurança** para servidores Linux, usando **Az
 - [Por que isso existe](#por-que-isso-existe)
 - [Arquitetura](#arquitetura)
 - [Estrutura do repositório](#estrutura-do-repositório)
+- [Setup passo a passo (do zero)](#setup-passo-a-passo-do-zero)
 - [1. Inventário dos servidores](#1-inventário-dos-servidores)
 - [2. Pipeline (agendamento + orquestração)](#2-pipeline-agendamento--orquestração)
 - [3. Playbook Ansible](#3-playbook-ansible)
@@ -60,6 +61,108 @@ flowchart LR
 ```
 
 ---
+
+## Setup passo a passo (do zero)
+
+Tudo o que precisa existir **fora do código** para a esteira funcionar. Os exemplos usam nomes fictícios —
+substitua pelos do seu ambiente.
+
+### Passo 1 — Gerar o par de chaves SSH
+
+A esteira autentica por chave, nunca por senha:
+
+```bash
+ssh-keygen -t rsa -b 4096 -C "infra-patch-mensal" -f id_rsa_patch
+```
+
+Gera `id_rsa_patch` (privada — vai para o cofre do CI/CD) e `id_rsa_patch.pub` (pública — vai para os servidores).
+
+### Passo 2 — Cadastrar a chave pública em cada servidor
+
+Em **todos** os hosts que vão receber patch, como root:
+
+```bash
+mkdir -p /root/.ssh && chmod 700 /root/.ssh
+echo "<conteúdo de id_rsa_patch.pub>" >> /root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
+```
+
+> ⚠️ Sem esse passo o host é reportado como *unreachable* e simplesmente **não recebe patch** — sem erro fatal na
+> pipeline, o que torna a falha fácil de passar despercebida. Vale conferir a lista de hosts alcançados no log de
+> cada execução.
+
+### Passo 3 — Subir a chave privada no cofre de segredos
+
+No Azure DevOps: `Pipelines → Library → Secure files → + Secure file`, subindo o arquivo `id_rsa_patch` (a chave
+**privada**). O nome precisa bater com o referenciado no YAML:
+
+```yaml
+- task: DownloadSecureFile@1
+  name: sshKey
+  inputs:
+    secureFile: 'id_rsa_patch'   # <-- mesmo nome do arquivo no cofre
+```
+
+Em **Security**, autorize a pipeline a usá-lo, senão a execução falha no download.
+
+> Em outros orquestradores o equivalente é: *GitHub Actions* → um secret com o conteúdo da chave, escrito em
+> arquivo no início do job; *GitLab CI* → variável do tipo `File`; *Jenkins* → credencial `SSH Username with
+> private key`.
+
+### Passo 4 — Preparar o agente de execução
+
+O agente que roda a pipeline precisa de:
+
+- **Ansible instalado** — este padrão assume o binário já presente. Valide com `ansible-playbook --version`.
+  (Se preferir instalar a cada execução, adicione um passo `apt-get install -y ansible` antes da execução.)
+- **Conectividade SSH (porta 22)** com todos os IPs do inventário.
+
+### Passo 5 — Criar o webhook de notificação
+
+No Google Chat: `Gerenciar webhooks → Adicionar webhook`, e copie a URL. Guarde-a como **variável secreta** do
+orquestrador (ex.: `PATCH_WEBHOOK_URL`) e injete-a no script em runtime — o script já está preparado para isso:
+
+```bash
+WEBHOOK_URL="${PATCH_WEBHOOK_URL:-https://chat.example.com/webhook/EXEMPLO}"
+```
+
+> ⚠️ Nunca versione a URL do webhook no repositório: ela contém token de autenticação e permite postar mensagens
+> arbitrárias no canal. Veja [Boas práticas de segurança](#boas-práticas-de-segurança).
+
+### Passo 6 — Popular o inventário
+
+Edite `inventory.ini` com uma linha por servidor. Prefixar com `#` desativa o host temporariamente:
+
+```ini
+[vms_patch]
+web01        ansible_host=10.0.1.10
+web02        ansible_host=10.0.1.11
+#db01        ansible_host=10.0.1.20   ← temporariamente fora do patch
+```
+
+### Passo 7 — Criar a pipeline
+
+`Pipelines → New pipeline → (seu repositório) → Existing Azure Pipelines YAML file → /azure-pipelines.yml`.
+Salve **sem executar** na primeira vez e confirme que a agenda aparece em `Edit → Triggers → Scheduled`.
+
+### Passo 8 — Primeira execução controlada
+
+Antes de soltar na frota inteira:
+
+1. Comente no `inventory.ini` todos os hosts menos um de homologação.
+2. Rode manualmente (`Run pipeline`).
+3. Confirme a mensagem chegando no canal de chat e o host aparecendo como alcançado no log.
+4. Só então restaure a lista completa.
+
+### Checklist final
+
+| Item | Onde vive |
+|---|---|
+| Chave privada `id_rsa_patch` | Cofre de segredos do CI/CD (nunca no Git) |
+| Chave pública | `/root/.ssh/authorized_keys` de cada servidor |
+| URL do webhook | Variável secreta do CI/CD (nunca no Git) |
+| Agente com Ansible + rota SSH | Pool de agentes self-hosted |
+| Lista de servidores | `inventory.ini` (versionado) |
 
 ## 1. Inventário dos servidores
 
