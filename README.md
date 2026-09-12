@@ -16,6 +16,7 @@ Automação de **patch mensal de segurança** para servidores Linux, usando **Az
 - [3. Playbook Ansible](#3-playbook-ansible)
 - [4. Script de patch](#4-script-de-patch)
 - [Fluxo de execução completo](#fluxo-de-execução-completo)
+- [Comandos úteis / como testar](#comandos-úteis--como-testar)
 - [Como adaptar para o seu ambiente](#como-adaptar-para-o-seu-ambiente)
 - [Boas práticas de segurança](#boas-práticas-de-segurança)
 
@@ -261,6 +262,60 @@ fi
 4. Em cada host: corrige GPG (se aplicável) → copia o script → executa → captura a saída → remove o script.
 5. Dentro do script: `apt update` → separa kernel/comuns → filtra blacklist → aplica upgrade → compara antes/depois → notifica.
 6. A pipeline segue para o próximo host, independente do resultado do anterior.
+
+## Comandos úteis / como testar
+
+Exemplos práticos para validar o playbook antes de deixar o cron rodar sozinho.
+
+**Testar conectividade SSH com todos os servidores do inventário:**
+```bash
+ansible all -i inventory.ini -m ping -u root --private-key ~/.ssh/id_rsa_patch
+```
+
+**Checar a sintaxe do playbook (sem conectar em nada):**
+```bash
+ansible-playbook -i inventory.ini patch-playbook.yml --syntax-check
+```
+
+**Listar quais hosts o playbook alcançaria, sem executar nada:**
+```bash
+ansible-playbook -i inventory.ini patch-playbook.yml --list-hosts
+```
+
+**Rodar em modo *dry-run* (não aplica mudanças, só mostra o que faria):**
+```bash
+ansible-playbook -i inventory.ini patch-playbook.yml --check --diff \
+  -u root --private-key ~/.ssh/id_rsa_patch
+```
+> ⚠️ `--check` tem efeito limitado aqui: as tasks `command`/`shell` (como a que roda o `patch.sh`) não sabem simular — o Ansible só reporta que *pularia* essas tasks em check mode, não o que o script faria de fato.
+
+**Rodar de verdade, mas limitado a um único servidor (útil para validar um host novo antes de incluir todo mundo):**
+```bash
+ansible-playbook -i inventory.ini patch-playbook.yml --limit web01 \
+  -u root --private-key ~/.ssh/id_rsa_patch -vv
+```
+
+**Rodar o script de patch direto via SSH, sem passar pelo Ansible (debug rápido):**
+```bash
+ssh -i ~/.ssh/id_rsa_patch root@web01 'bash -s' < patch.sh
+```
+
+**Lint do playbook (boas práticas / erros comuns):**
+```bash
+pip install ansible-lint
+ansible-lint patch-playbook.yml
+```
+
+**Disparar a pipeline manualmente via Azure CLI, sem passar pela interface web:**
+```bash
+az pipelines run --name "Ansible-Patch-Mensal-Linux" --branch main
+```
+
+**Ver as últimas execuções da pipeline e seus resultados:**
+```bash
+az pipelines runs list --pipeline-name "Ansible-Patch-Mensal-Linux" --top 10 \
+  --query "[].{data:queueTime, resultado:result}" -o table
+```
 
 ## Como adaptar para o seu ambiente
 
