@@ -1,5 +1,11 @@
 # Ansible Linux Patch Automation
 
+![Ansible](https://img.shields.io/badge/Ansible-EE0000?style=flat&logo=ansible&logoColor=white)
+![Azure Pipelines](https://img.shields.io/badge/Azure%20Pipelines-0078D7?style=flat&logo=azuredevops&logoColor=white)
+![Bash](https://img.shields.io/badge/Bash-4EAA25?style=flat&logo=gnubash&logoColor=white)
+![Linux](https://img.shields.io/badge/Linux-FCC624?style=flat&logo=linux&logoColor=black)
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+
 Automação de **patch mensal de segurança** para servidores Linux, usando **Azure Pipelines** para agendamento/execução, **Ansible** para orquestração via SSH e um **script Bash** que aplica os updates e notifica o resultado em um canal de chat (Google Chat, Slack, Teams, etc.).
 
 > Este repositório documenta o **padrão de arquitetura**, não uma implementação de produção específica. Todos os hostnames, IPs, URLs e credenciais abaixo são **exemplos fictícios** — substitua pelos valores reais do seu ambiente.
