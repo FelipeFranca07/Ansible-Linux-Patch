@@ -13,7 +13,7 @@ Automação de **patch mensal de segurança** para servidores Linux, usando **Az
 
 > ℹ️ O exemplo usa **Azure Pipelines** como orquestrador de CI/CD, mas o padrão é independente de ferramenta — a mesma lógica (agendamento via cron, inventário Ansible, script de patch, notificação) se aplica igualmente a **GitHub Actions, GitLab CI, Jenkins** ou qualquer outro orquestrador com suporte a agendamento e a um agente com acesso SSH aos servidores.
 
-![Arquitetura](ansible-linux-patch-architecture.png)
+![Arquitetura](ansible-linux-patch-architecture.jpg)
 
 ## Índice
 
